@@ -85,6 +85,12 @@ cd /path/to/target
 /path/to/strixcodex/scripts/run-strix.sh -t .
 ```
 
+On startup the helper checks PyPI for a newer `strix-agent` release and, in an
+interactive terminal, asks whether to run `uv tool upgrade strix-agent` before
+launching. The check is non-blocking — if you are offline or PyPI is
+unreachable it is skipped silently — and non-interactive runs only print the
+upgrade command. Disable it entirely with `STRIX_VERSION_CHECK=0`.
+
 ## Tests
 
 ```bash

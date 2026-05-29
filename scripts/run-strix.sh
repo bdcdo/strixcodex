@@ -20,6 +20,58 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DOCKER_BRIDGE_HOST="${STRIXCODEX_BRIDGE_IP:-$(ip -4 addr show docker0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)}"
 DOCKER_BRIDGE_HOST="${DOCKER_BRIDGE_HOST:-172.17.0.1}"
 
+# Strix is installed as the PyPI package strix-agent (via `uv tool`). Before
+# launching, check PyPI for a newer release and, in an interactive terminal,
+# offer to upgrade. Fully non-blocking: any failure (no network, PyPI down,
+# missing tools) just returns and the run continues. Disable with
+# STRIX_VERSION_CHECK=0.
+PYPI_PKG="strix-agent"
+
+check_strix_version() {
+  command -v curl >/dev/null 2>&1 || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  local installed latest newer
+  installed="$(strix --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  [ -n "$installed" ] || return 0
+
+  latest="$(curl -fsS --max-time 3 "https://pypi.org/pypi/${PYPI_PKG}/json" 2>/dev/null \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["info"]["version"])' 2>/dev/null || true)"
+  [ -n "$latest" ] || return 0
+
+  newer="$(python3 - "$installed" "$latest" <<'PY' 2>/dev/null || true
+import sys
+inst, latest = sys.argv[1], sys.argv[2]
+try:
+    from packaging.version import Version
+    print("1" if Version(latest) > Version(inst) else "")
+except Exception:
+    print("1" if inst != latest else "")
+PY
+)"
+  if [ -z "$newer" ]; then
+    echo "[run-strix] strix-agent atualizado (${installed})" >&2
+    return 0
+  fi
+
+  echo "[run-strix] strix-agent desatualizado: instalado ${installed}, disponível ${latest}" >&2
+  if [ -t 0 ]; then
+    printf '[run-strix] atualizar agora com "uv tool upgrade %s"? [y/N] ' "$PYPI_PKG" >&2
+    local reply=""
+    read -r reply || true
+    case "$reply" in
+      [yY]|[yY][eE][sS])
+        uv tool upgrade "$PYPI_PKG" >&2 || echo "[run-strix] upgrade falhou, seguindo com ${installed}" >&2
+        ;;
+      *) echo "[run-strix] mantendo ${installed}" >&2 ;;
+    esac
+  else
+    echo "[run-strix] (não-interativo) para atualizar: uv tool upgrade ${PYPI_PKG}" >&2
+  fi
+}
+
+case "${STRIX_VERSION_CHECK:-1}" in 0|no|off|false) : ;; *) check_strix_version ;; esac
+
 if ! curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
   echo "[run-strix] starting strixcodex proxy on ${PROXY_BIND}:${PROXY_PORT}..." >&2
   (cd "$PROJECT_DIR" && uv run python -m strixcodex --host "$PROXY_BIND" --port "$PROXY_PORT") &
