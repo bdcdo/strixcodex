@@ -20,6 +20,75 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DOCKER_BRIDGE_HOST="${STRIXCODEX_BRIDGE_IP:-$(ip -4 addr show docker0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)}"
 DOCKER_BRIDGE_HOST="${DOCKER_BRIDGE_HOST:-172.17.0.1}"
 
+# Strix is installed as the PyPI package strix-agent (via `uv tool`). Before
+# launching, check PyPI for a newer release and, in an interactive terminal,
+# offer to upgrade. Fully non-blocking: any failure (no network, PyPI down,
+# missing tools) just returns and the run continues. Disable with
+# STRIX_VERSION_CHECK=0. The check runs at most once a day (cached below).
+PYPI_PKG="strix-agent"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/strixcodex"
+CACHE_FILE="$CACHE_DIR/version-check"
+
+check_strix_version() {
+  command -v curl >/dev/null 2>&1 || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  # Throttle: skip if we already checked within the last 24h. find -mmin avoids
+  # date arithmetic; an empty result means the file is newer than 1440 minutes.
+  if [ -f "$CACHE_FILE" ] && [ -z "$(find "$CACHE_FILE" -mmin +1440 2>/dev/null)" ]; then
+    return 0
+  fi
+
+  local installed latest newer runner=""
+  command -v timeout >/dev/null 2>&1 && runner="timeout 5"
+  installed="$($runner strix --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  [ -n "$installed" ] || return 0
+
+  latest="$(curl -fsS --max-time 3 "https://pypi.org/pypi/${PYPI_PKG}/json" 2>/dev/null \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["info"]["version"])' 2>/dev/null || true)"
+  [ -n "$latest" ] || return 0
+
+  # Record a successful PyPI check so we don't hit the network again today. Done
+  # only after latest is known, so a transient failure retries next run.
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+  : > "$CACHE_FILE" 2>/dev/null || true
+
+  newer="$(python3 - "$installed" "$latest" <<'PY' 2>/dev/null || true
+import sys
+inst, latest = sys.argv[1], sys.argv[2]
+try:
+    from packaging.version import Version
+    print("1" if Version(latest) > Version(inst) else "")
+except Exception:
+    print("1" if inst != latest else "")
+PY
+)"
+  if [ -z "$newer" ]; then
+    echo "[run-strix] strix-agent up to date (${installed})" >&2
+    return 0
+  fi
+
+  echo "[run-strix] strix-agent out of date: installed ${installed}, available ${latest}" >&2
+  if [ -t 0 ]; then
+    printf '[run-strix] upgrade now with "uv tool upgrade %s"? [y/N] ' "$PYPI_PKG" >&2
+    local reply=""
+    read -r reply || true
+    case "$reply" in
+      [yY]|[yY][eE][sS])
+        uv tool upgrade "$PYPI_PKG" >&2 || echo "[run-strix] upgrade failed, continuing with ${installed}" >&2
+        ;;
+      *) echo "[run-strix] keeping ${installed}" >&2 ;;
+    esac
+  else
+    echo "[run-strix] (non-interactive) to upgrade: uv tool upgrade ${PYPI_PKG}" >&2
+  fi
+}
+
+case "${STRIX_VERSION_CHECK:-1}" in
+  0|[nN][oO]|[oO][fF][fF]|[fF][aA][lL][sS][eE]) : ;;
+  *) check_strix_version ;;
+esac
+
 if ! curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
   echo "[run-strix] starting strixcodex proxy on ${PROXY_BIND}:${PROXY_PORT}..." >&2
   (cd "$PROJECT_DIR" && uv run python -m strixcodex --host "$PROXY_BIND" --port "$PROXY_PORT") &
